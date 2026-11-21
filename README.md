@@ -1700,3 +1700,8 @@ git push origin feature/your-task-name
 • Open a Pull Request.
 
 Built with ❤️ on Stellar
+
+## Handsoff notes
+
+<!-- handsoff-issue-541 -->
+- #541: [Contracts] Strengthen reinit guard with version + admin one-time init
