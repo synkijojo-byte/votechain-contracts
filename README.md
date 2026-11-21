@@ -1708,3 +1708,6 @@ Built with ❤️ on Stellar
 
 <!-- handsoff-issue-542 -->
 - #542: [Contracts] Add a quorum floor enforcement test against trivially small quorum
+
+<!-- handsoff-issue-543 -->
+- #543: [Contracts] Add overflow-safe tally accounting tests for max i128 votes
