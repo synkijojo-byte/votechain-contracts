@@ -1705,3 +1705,6 @@ Built with ❤️ on Stellar
 
 <!-- handsoff-issue-541 -->
 - #541: [Contracts] Strengthen reinit guard with version + admin one-time init
+
+<!-- handsoff-issue-542 -->
+- #542: [Contracts] Add a quorum floor enforcement test against trivially small quorum
