@@ -30,8 +30,10 @@
  * endpoint. Cache invalidation is triggered by invalidateProposalCache(id?).
  */
 
+import { getConfig } from "../config";
 import { createClient, RedisClientType } from "redis";
 import { Request, Response, NextFunction } from "express";
+import { createHash } from "crypto";
 import { log } from "./requestTracing";
 
 // ── Redis client ───────────────────────────────────────────────────────────
@@ -108,7 +110,7 @@ async function attemptConnect(url: string): Promise<void> {
  * Background reconnect attempts run with exponential backoff (max 5).
  */
 export async function connectRedis(
-  url = process.env.REDIS_URL ?? "redis://localhost:6379"
+  url = getConfig().redisUrl ?? "redis://localhost:6379"
 ): Promise<void> {
   try {
     await attemptConnect(url);
@@ -142,13 +144,11 @@ export function getCacheMetrics() {
 // ── TTL constants ──────────────────────────────────────────────────────────
 
 const TTL = {
-  PROPOSAL_LIST: parseInt(process.env.PROPOSAL_LIST_TTL ?? "30", 10),
-  PROPOSAL_ITEM: parseInt(process.env.PROPOSAL_ITEM_TTL ?? "10", 10),
+  PROPOSAL_LIST: getConfig().proposalListTtl,
+  PROPOSAL_ITEM: getConfig().proposalItemTtl,
 };
 
-export const LEADERBOARD_CACHE_TTL_SECONDS = Number(
-  process.env.LEADERBOARD_CACHE_TTL ?? 60,
-);
+export const LEADERBOARD_CACHE_TTL_SECONDS = getConfig().leaderboardCacheTtl;
 
 if (
   !Number.isSafeInteger(LEADERBOARD_CACHE_TTL_SECONDS) ||
@@ -163,6 +163,35 @@ const KEY = {
   list: (req: Request) => `proposals:list:${req.originalUrl}`,
   item: (id: string | number) => `proposals:item:${id}`,
 };
+
+// ── ETag helpers ───────────────────────────────────────────────────────────
+
+/**
+ * Compute a deterministic, strong ETag for a serialized response body.
+ * Uses SHA-256 of the payload so identical bodies always yield the same tag.
+ */
+export function computeEtag(serialized: string): string {
+  const hash = createHash("sha256").update(serialized).digest("hex");
+  return `"${hash}"`;
+}
+
+/**
+ * Returns true when the request's If-None-Match header matches the given
+ * ETag. Handles comma-separated lists, the wildcard `*`, and weak validators
+ * (`W/"..."`).
+ */
+export function ifNoneMatchMatches(
+  header: string | string[] | undefined,
+  etag: string
+): boolean {
+  if (!header) return false;
+  const raw = Array.isArray(header) ? header.join(",") : header;
+  const normalized = etag.replace(/^W\//, "");
+  return raw
+    .split(",")
+    .map((t) => t.trim())
+    .some((t) => t === "*" || t.replace(/^W\//, "") === normalized);
+}
 
 // ── Middleware factory ─────────────────────────────────────────────────────
 
@@ -187,6 +216,12 @@ function cacheMiddleware(keyFn: (req: Request) => string, ttl: number) {
       if (cached !== null) {
         metrics.hits++;
         res.setHeader("X-Cache", "HIT");
+        const etag = computeEtag(cached);
+        res.setHeader("ETag", etag);
+        if (ifNoneMatchMatches(req.headers["if-none-match"], etag)) {
+          res.status(304).end();
+          return;
+        }
         res.setHeader("Content-Type", "application/json");
         return res.send(cached);
       }
@@ -203,7 +238,8 @@ function cacheMiddleware(keyFn: (req: Request) => string, ttl: number) {
     // Intercept res.json to store the response in Redis
     const originalJson = res.json.bind(res);
     res.json = (body: unknown) => {
-      if (isRedisReady() && redis) {
+      // Never cache errors: a hit would replay them with status 200.
+      if (res.statusCode === 200 && isRedisReady() && redis) {
         const serialized = JSON.stringify(body);
         redis.setEx(key, ttl, serialized).catch((err) =>
           log("error", "redis setEx error", { error: String(err) })

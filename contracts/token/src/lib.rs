@@ -1,18 +1,34 @@
-//! Token contract with governance proposal support.
-//!
-//! Proposals snapshot the total supply at creation time so that later mints
-//! cannot relax the quorum bound enforced by `update_quorum`.
+// Copyright 2024 VoteChain Contributors
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
-use soroban_sdk::{contract, contractimpl, contracttype, Address, Env};
+#![no_std]
 
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct Proposal {
-    pub id: u32,
-    pub quorum: i128,
-    /// Total supply captured when the proposal was created.
-    pub supply_snapshot: i128,
-}
+mod events;
+mod reward;
+mod staking;
+mod storage;
+mod types;
+
+#[cfg(test)]
+mod test;
+
+use soroban_sdk::{contract, contractimpl, Address, Env};
+use storage::*;
+use types::{Allowance, ContractError, MIN_TRANSFER_WINDOW};
+
+// SEC-004: Stellar null/zero address used as the sentinel for invalid inputs.
+const ZERO_ADDRESS: &str = "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF";
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -86,10 +102,118 @@ impl TokenContract {
         if quorum > proposal.supply_snapshot {
             panic!("quorum exceeds supply snapshot");
         }
-        proposal.quorum = quorum;
-        env.storage()
-            .instance()
-            .set(&DataKey::Proposal(id), &proposal);
+        set_admin(&env, &new_admin);
+        events::admin_transferred(&env, &admin, &new_admin);
+        Ok(())
+    }
+
+    /// SEC-006: Proposes a two-step admin key rotation.
+    ///
+    /// Nominates `new_admin` with an acceptance window of `window_secs` seconds
+    /// (default 48 h when `0`). The admin key is NOT transferred until the
+    /// nominee calls [`accept_admin_transfer`] within the window.
+    ///
+    /// # Errors
+    /// - [`ContractError::InvalidAddress`] if either address is the zero address.
+    /// - [`ContractError::NotAdmin`] if `admin` does not match the stored admin.
+    /// - [`ContractError::TransferWindowTooShort`] if `window_secs` is non-zero and
+    ///   less than [`MIN_TRANSFER_WINDOW`] (300 seconds).
+    pub fn propose_admin_transfer(
+        env: Env,
+        admin: Address,
+        new_admin: Address,
+        window_secs: u64,
+    ) -> Result<(), ContractError> {
+        // SEC-005: auth first.
+        admin.require_auth();
+        // SEC-004: reject zero addresses for both parameters.
+        require_non_zero_address(&env, &admin)?;
+        require_non_zero_address(&env, &new_admin)?;
+        if get_admin(&env)? != admin {
+            return Err(ContractError::NotAdmin);
+        }
+        // Enforce minimum transfer window to absorb ledger-timestamp clock drift.
+        if window_secs != 0 && window_secs < MIN_TRANSFER_WINDOW {
+            return Err(ContractError::TransferWindowTooShort);
+        }
+        let window = if window_secs == 0 { 172_800 } else { window_secs }; // default 48 h
+        let expiry = env.ledger().timestamp() + window;
+        set_pending_admin(&env, &new_admin);
+        set_admin_transfer_expiry(&env, expiry);
+        events::admin_transfer_proposed(&env, &admin, &new_admin, expiry);
+        Ok(())
+    }
+
+    /// SEC-006: Accepts a pending admin key rotation.
+    ///
+    /// Must be called by the nominated address before the acceptance window expires.
+    /// On success the caller becomes the new admin and the nomination is cleared.
+    ///
+    /// # Errors
+    /// - [`ContractError::InvalidAddress`] if `new_admin` is the zero address.
+    /// - [`ContractError::PendingAdminNotSet`] if no nomination is outstanding.
+    /// - [`ContractError::NotPendingAdmin`] if `new_admin` is not the nominated address.
+    /// - [`ContractError::AdminTransferExpired`] if the acceptance window has passed.
+    pub fn accept_admin_transfer(env: Env, new_admin: Address) -> Result<(), ContractError> {
+        // SEC-005: auth first.
+        new_admin.require_auth();
+        // SEC-004: reject zero address.
+        require_non_zero_address(&env, &new_admin)?;
+        let pending = get_pending_admin(&env).ok_or(ContractError::PendingAdminNotSet)?;
+        if pending != new_admin {
+            return Err(ContractError::NotPendingAdmin);
+        }
+        if env.ledger().timestamp() > get_admin_transfer_expiry(&env) {
+            clear_pending_admin(&env);
+            return Err(ContractError::AdminTransferExpired);
+        }
+        let old_admin = get_admin(&env)?;
+        set_admin(&env, &new_admin);
+        clear_pending_admin(&env);
+        events::admin_transferred(&env, &old_admin, &new_admin);
+        Ok(())
+    }
+
+    /// Returns the contract version as a `(major, minor, patch)` semver tuple.
+    pub fn get_version(env: Env) -> (u32, u32, u32) {
+        get_version(&env)
+    }
+
+    /// Returns the remaining spending allowance granted by `owner` to `spender`.
+    ///
+    /// Returns `0` if no allowance has been set, if the allowance has been fully
+    /// spent, or if the allowance has expired (`current_ledger > expiry_ledger`).
+    pub fn allowance(env: Env, owner: Address, spender: Address) -> i128 {
+        storage::allowance(&env, &owner, &spender)
+    }
+
+    /// SEC-013 / ADR-013: Locks `amount` tokens for `lock_duration_seconds`,
+    /// granting a time-weighted voting-power multiplier once staked.
+    ///
+    /// # Errors
+    /// - [`ContractError::InvalidAmount`] if `amount` is zero or negative.
+    /// - [`ContractError::InvalidLockDuration`] if the duration exceeds
+    ///   `staking::MAX_LOCK_DAYS`.
+    /// - [`ContractError::AlreadyStaked`] if `staker` already has a position.
+    /// - [`ContractError::InsufficientBalance`] if the transferable balance is
+    ///   less than `amount`.
+    pub fn stake(
+        env: Env,
+        staker: Address,
+        amount: i128,
+        lock_duration_seconds: u64,
+    ) -> Result<(), ContractError> {
+        staking::stake(&env, staker, amount, lock_duration_seconds)
+    }
+
+    /// SEC-013 / ADR-013: Releases an expired stake position, restoring the
+    /// locked tokens to the transferable balance.
+    ///
+    /// # Errors
+    /// - [`ContractError::StakeNotFound`] if `staker` has no active position.
+    /// - [`ContractError::StakeLocked`] if `locked_until` has not yet passed.
+    pub fn unstake(env: Env, staker: Address) -> Result<(), ContractError> {
+        staking::unstake(&env, staker)
     }
 }
 

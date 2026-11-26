@@ -14,16 +14,13 @@
 
 import { Pool } from "pg";
 import { Router, Request, Response } from "express";
+import { getConfig } from "../config";
 import { getRedis } from "../middleware/redisCache";
 import { log } from "../middleware/requestTracing";
 
 const { version } = require("../../package.json") as { version?: string };
 const router = Router();
-const timeoutMs = Number(process.env.HEALTH_CHECK_TIMEOUT_MS ?? 2_000);
-
-if (!Number.isSafeInteger(timeoutMs) || timeoutMs <= 0) {
-  throw new Error("HEALTH_CHECK_TIMEOUT_MS must be a positive integer.");
-}
+const timeoutMs = getConfig().healthCheckTimeoutMs;
 
 let dbPool: Pool | undefined;
 
@@ -54,7 +51,7 @@ async function checkComponent(
 }
 
 async function checkDatabase(): Promise<void> {
-  const connectionString = process.env.DATABASE_URL;
+  const connectionString = getConfig().databaseUrl;
   if (!connectionString) {
     throw new Error("DATABASE_URL is not configured.");
   }
@@ -78,7 +75,7 @@ async function checkRedis(): Promise<void> {
 }
 
 async function checkStellarRpc(): Promise<void> {
-  const rpcUrl = process.env.STELLAR_RPC_URL;
+  const rpcUrl = getConfig().stellarRpcUrl;
   if (!rpcUrl) {
     throw new Error("STELLAR_RPC_URL is not configured.");
   }
@@ -111,17 +108,22 @@ async function checkStellarRpc(): Promise<void> {
   }
 }
 
-async function getComponentStatuses() {
+async function getComponentStatuses(includeStellarRpc = true) {
   const [db, redis, stellar_rpc] = await Promise.all([
     checkComponent("db", checkDatabase),
     checkComponent("redis", checkRedis),
-    checkComponent("stellar_rpc", checkStellarRpc),
+    includeStellarRpc
+      ? checkComponent("stellar_rpc", checkStellarRpc)
+      : Promise.resolve<ComponentStatus>("healthy"),
   ]);
-  return { db, redis, stellar_rpc };
+  return includeStellarRpc ? { db, redis, stellar_rpc } : { db, redis };
 }
 
-async function sendReadiness(res: Response): Promise<void> {
-  const components = await getComponentStatuses();
+async function sendReadiness(
+  res: Response,
+  includeStellarRpc = true,
+): Promise<void> {
+  const components = await getComponentStatuses(includeStellarRpc);
   const healthy = Object.values(components).every(
     (status) => status === "healthy",
   );
@@ -148,6 +150,18 @@ router.get("/live", (_req: Request, res: Response) => {
     uptime: process.uptime(),
     version: version ?? "1.0.0",
   });
+});
+
+router.get("/healthz", (_req: Request, res: Response) => {
+  res.status(200).json({
+    status: "ok",
+    uptime: process.uptime(),
+    version: version ?? "1.0.0",
+  });
+});
+
+router.get("/readyz", (_req: Request, res: Response) => {
+  void sendReadiness(res, false);
 });
 
 export default router;
